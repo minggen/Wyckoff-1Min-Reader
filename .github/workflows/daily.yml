@@ -65,8 +65,7 @@ jobs:
             git push origin HEAD:main
           fi
 
-
-          - name: Notify Telegram
+      - name: Notify Telegram
         if: success()
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -102,7 +101,7 @@ jobs:
           fi
 
           # 2.2 处理文案：写入临时文件，避免 Shell 变量转义问题
-          # 注意：这里 python 的输出直接重定向到 caption.txt
+          # python 的输出直接重定向到 caption.txt
           python - "$REPORT_FILE" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" <<'PY' > /tmp/caption.txt
           import pathlib, sys
           
@@ -127,10 +126,8 @@ jobs:
 
           echo "=== 3. 发送请求 ==="
           # 3.1 根据是否有图选择发送方式
-          # 注意：curl 的 < 符号用于从文件读取字段内容，@ 符号用于上传文件
           if [ "$HAS_IMAGE" = true ]; then
             echo "Sending Photo..."
-            # 移除 -s (silent) 添加 -v (verbose) 以便出错时看到详细日志
             curl -v -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto" \
               -F "chat_id=${TG_CHAT_ID}" \
               -F "photo=@/tmp/chart.png" \
