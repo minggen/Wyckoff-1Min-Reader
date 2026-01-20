@@ -12,17 +12,15 @@ from xhtml2pdf import pisa
 from sheet_manager import SheetManager 
 
 # ==========================================
-# 1. 数据获取模块 (保持 zfill 补全逻辑)
+# 1. 数据获取模块
 # ==========================================
 
 def fetch_stock_data_dynamic(symbol: str, buy_date_str: str) -> dict:
-    # 强制补全6位
     clean_digits = ''.join(filter(str.isdigit, str(symbol)))
     symbol_code = clean_digits.zfill(6)
     
     print(f"   -> 正在分析 {symbol_code} (买入日期: {buy_date_str})...")
 
-    # 计算时间窗口
     try:
         if buy_date_str and str(buy_date_str) != 'nan' and len(str(buy_date_str)) >= 10:
             buy_dt = datetime.strptime(str(buy_date_str)[:10], "%Y-%m-%d")
@@ -33,7 +31,6 @@ def fetch_stock_data_dynamic(symbol: str, buy_date_str: str) -> dict:
     except:
         start_date_em = (datetime.now() - timedelta(days=15)).strftime("%Y%m%d")
 
-    # 获取数据 (5min)
     try:
         df = ak.stock_zh_a_hist_min_em(symbol=symbol_code, period="5", start_date=start_date_em, adjust="qfq")
     except Exception as e:
@@ -43,7 +40,6 @@ def fetch_stock_data_dynamic(symbol: str, buy_date_str: str) -> dict:
     if df.empty:
         return {"df": pd.DataFrame(), "period": "5m"}
 
-    # 策略切换 (15min)
     current_period = "5m"
     if len(df) > 960:
         print(f"   [策略] 数据量大，切换至 15min...")
@@ -56,7 +52,6 @@ def fetch_stock_data_dynamic(symbol: str, buy_date_str: str) -> dict:
         except:
             df = df.tail(960)
 
-    # 清洗
     rename_map = {"时间": "date", "开盘": "open", "最高": "high", "最低": "low", "收盘": "close", "成交量": "volume"}
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
     
@@ -100,11 +95,10 @@ def generate_local_chart(symbol: str, df: pd.DataFrame, save_path: str, period: 
         print(f"   [Error] 绘图失败: {e}")
 
 # ==========================================
-# 3. AI 分析模块 (纯文本注入 + 强制报错逻辑)
+# 3. AI 分析模块 (3.0 Pro Preview + 安全豁免)
 # ==========================================
 
 def get_prompt_content(symbol, df, position_info):
-    # 1. 读取 Prompt 模板
     prompt_template = os.getenv("WYCKOFF_PROMPT_TEMPLATE")
     if not prompt_template and os.path.exists("prompt_secret.txt"):
         try:
@@ -113,18 +107,14 @@ def get_prompt_content(symbol, df, position_info):
         except: pass
     if not prompt_template: return None
 
-    # 2. 准备基础数据
     csv_data = df.to_csv(index=False)
     latest = df.iloc[-1]
 
-    # 3. 替换模板中的基础变量
     base_prompt = prompt_template.replace("{symbol}", symbol) \
                           .replace("{latest_time}", str(latest["date"])) \
                           .replace("{latest_price}", str(latest["close"])) \
                           .replace("{csv_data}", csv_data)
     
-    # 4. === 核心修改：纯文本注入持仓信息 ===
-    # 不做任何计算，直接把字典里的数据拼成字符串，贴在最后
     buy_date = position_info.get('date', 'N/A')
     buy_price = position_info.get('price', 'N/A')
     qty = position_info.get('qty', 'N/A')
@@ -135,7 +125,7 @@ def get_prompt_content(symbol, df, position_info):
         f"Buy Date: {buy_date}\n"
         f"Cost Price: {buy_price}\n"
         f"Quantity: {qty}\n"
-        f"(Note: Please analyze the current trend based on this position cost.)"
+        f"(Note: Please analyze the current trend based on this position data.)"
     )
     
     return base_prompt + position_text
@@ -143,36 +133,62 @@ def get_prompt_content(symbol, df, position_info):
 def call_gemini_http(prompt: str) -> str:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key: raise ValueError("GEMINI_API_KEY missing")
-    model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp") 
+    
+    # 👇 切换为 gemini-3-pro-preview
+    model_name = os.getenv("GEMINI_MODEL", "gemini-3-pro-preview") 
     
     print(f"   >>> Gemini ({model_name})...")
     
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     headers = {'Content-Type': 'application/json'}
+    
+    # 安全设置：BLOCK_NONE 豁免
+    safety_settings = [
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+    ]
+
     data = {
         "contents": [{"parts": [{"text": prompt}]}],
         "system_instruction": {"parts": [{"text": "You are Richard D. Wyckoff."}]},
-        "generationConfig": {"temperature": 0.2}
+        "generationConfig": {"temperature": 0.2},
+        "safetySettings": safety_settings 
     }
     
-    resp = requests.post(url, headers=headers, json=data, timeout=30)
+    # 超时保持 120s
+    resp = requests.post(url, headers=headers, json=data, timeout=120)
     
     if resp.status_code != 200: 
         raise Exception(f"Gemini API Error {resp.status_code}: {resp.text}")
     
     try:
         result = resp.json()
-        content = result.get('candidates', [])[0].get('content', {})
-        text = content.get('parts', [])[0].get('text', '')
-        if not text: raise ValueError("Empty text")
+        candidates = result.get('candidates', [])
+        if not candidates: raise ValueError("No candidates")
+        
+        content = candidates[0].get('content', {})
+        parts = content.get('parts', [])
+        
+        if not parts:
+            reason = candidates[0].get('finishReason', 'UNKNOWN')
+            raise ValueError(f"Content parts empty. FinishReason: {reason}")
+            
+        text = parts[0].get('text', '')
+        if not text: raise ValueError("Empty text string")
+        
         return text
     except Exception as e:
-        print(f"   [Debug] Gemini 解析失败，原始响应: {resp.text[:100]}...")
+        print(f"   [Debug] Gemini 解析失败. Status: {resp.status_code}")
+        print(f"   [Debug] 响应片段: {resp.text[:200]}") 
         raise e 
 
 def call_openai_official(prompt: str) -> str:
     api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key: raise ValueError("OpenAI Key missing")
+    # 如果没有 key，直接报错，不 fallback (因为您现在余额不足)
+    if not api_key: raise ValueError("OpenAI Key missing, cannot fallback.")
+    
     model_name = os.getenv("AI_MODEL", "gpt-4o")
     print(f"   >>> 🔄 Switching to OpenAI ({model_name})...")
     
@@ -191,9 +207,11 @@ def ai_analyze(symbol, df, position_info):
     try: 
         return call_gemini_http(prompt)
     except Exception as e: 
-        print(f"   ⚠️ Gemini Error: {e}")
-        try: return call_openai_official(prompt)
-        except Exception as e2: return f"Analysis Failed: {e2}"
+        print(f"   ⚠️ Gemini 失败: {e}")
+        try: 
+            return call_openai_official(prompt)
+        except Exception as e2: 
+            return f"Analysis Failed. Gemini Error: {e}. OpenAI Error: {e2}"
 
 # ==========================================
 # 4. PDF 生成模块
