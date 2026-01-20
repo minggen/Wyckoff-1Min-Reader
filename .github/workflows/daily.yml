@@ -23,8 +23,6 @@ jobs:
           fetch-depth: 0
 
       # === 1. 安装系统依赖 (中文字体 + PDF底层库) ===
-      # 必须安装 libcairo2-dev 否则 xhtml2pdf 无法安装
-      # 必须安装 fonts-wqy-microhei 否则 PDF 中文乱码
       - name: Install System Dependencies
         run: |
           sudo apt-get update
@@ -36,14 +34,15 @@ jobs:
         with:
           python-version: "3.11"
 
-      # === 2. 安装 Python 依赖 ===
+      # === 2. 安装 Python 依赖 (增加了 gspread 和 oauth2client) ===
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas akshare mplfinance openai requests markdown xhtml2pdf
+          # 注意这里增加了 gspread oauth2client
+          pip install pandas akshare mplfinance openai requests markdown xhtml2pdf gspread oauth2client
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # === 3. 运行分析脚本 (自动读取 stock_list.txt) ===
+      # === 3. 运行分析脚本 (连接 Google Sheets) ===
       - name: Run Analysis Script
         env:
           # Google Gemini 配置
@@ -54,8 +53,12 @@ jobs:
           AI_MODEL: "gpt-4o"
           # 通用配置
           WYCKOFF_PROMPT_TEMPLATE: ${{ secrets.WYCKOFF_PROMPT_TEMPLATE }}
-          SYMBOLS: "600970" # 如果 stock_list.txt 不存在，以此为默认值
           BARS_COUNT: "600"
+          
+          # === 👇 核心修复：必须传入 Google Sheets 密钥 ===
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          SHEET_NAME: ${{ secrets.SHEET_NAME }}
+          
         run: |
           mkdir -p data reports
           python main.py
@@ -67,7 +70,7 @@ jobs:
           find reports/ -name "*.*" -type f -mtime +7 -print -delete
           find data/ -name "*.csv" -type f -mtime +7 -print -delete
 
-      # === 5. 提交新生成的 PDF 和 CSV 到仓库 ===
+      # === 5. 提交新生成的 PDF 和 CSV 到仓库 (保存历史记录) ===
       - name: Commit and push changes
         run: |
           git config user.name "github-actions[bot]"
@@ -81,7 +84,7 @@ jobs:
             git push origin HEAD:main
           fi
 
-   # === 6. 精准推送本次生成的报告 ===
+      # === 6. 精准推送本次生成的报告 ===
       - name: Notify Telegram (Push List)
         if: success()
         env:
@@ -98,27 +101,9 @@ jobs:
           
           echo "=== 开始推送 push_list.txt 中的文件 ==="
           
-          # 逐行读取 push_list.txt
           while IFS= read -r PDF_FILE || [ -n "$PDF_FILE" ]; do
             # 去除可能的空白符
             PDF_FILE=$(echo "$PDF_FILE" | xargs)
             
             if [ -f "$PDF_FILE" ]; then
-              echo "----------------------------------------"
-              echo "🚀 Sending: $PDF_FILE"
-              
-              FILENAME=$(basename "$PDF_FILE")
-              
-              curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
-                -F "chat_id=${TG_CHAT_ID}" \
-                -F "document=@$PDF_FILE" \
-                -F "caption=📊 Analysis: $FILENAME"
-                
-              echo "✅ Sent."
-              sleep 3
-            else
-              echo "::error::文件不存在: $PDF_FILE"
-            fi
-          done < push_list.txt
-          
-          echo "=== 推送完毕 ==="
+              echo "--------------------------------
