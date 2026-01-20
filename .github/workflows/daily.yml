@@ -48,7 +48,7 @@ jobs:
         env:
           # Google Gemini 配置
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: "gemini-3-flash-preview"
+          GEMINI_MODEL: "gemini-3-flash"
           # OpenAI 配置
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           AI_MODEL: "gpt-4o"
