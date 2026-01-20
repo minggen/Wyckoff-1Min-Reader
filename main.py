@@ -10,7 +10,8 @@ import numpy as np
 import markdown
 from xhtml2pdf import pisa
 from sheet_manager import SheetManager 
-import concurrent.futures 
+# 移除并发库，因为我们要强制串行加延迟
+# import concurrent.futures 
 
 # ==========================================
 # 1. 数据获取模块 (固定 500根 5min)
@@ -20,15 +21,10 @@ def fetch_stock_data_dynamic(symbol: str, buy_date_str: str) -> dict:
     clean_digits = ''.join(filter(str.isdigit, str(symbol)))
     symbol_code = clean_digits.zfill(6)
     
-    # === 核心修改：固定获取策略 ===
-    # 5分钟K线，每天48根。500根大约需要 10.5 个交易日。
-    # 为了保险（考虑周末、节假日），我们直接向前推 40 天，保证数据够多。
+    # 向前推 40 天
     start_date_em = (datetime.now() - timedelta(days=40)).strftime("%Y%m%d")
 
-    # print(f"   -> 正在获取 {symbol_code} 5分钟数据 (Limit: 500)...")
-
     try:
-        # 获取 5分钟 数据
         df = ak.stock_zh_a_hist_min_em(symbol=symbol_code, period="5", start_date=start_date_em, adjust="qfq")
     except Exception as e:
         print(f"   [Error] {symbol_code} AkShare接口报错: {e}")
@@ -37,7 +33,7 @@ def fetch_stock_data_dynamic(symbol: str, buy_date_str: str) -> dict:
     if df.empty:
         return {"df": pd.DataFrame(), "period": "5m"}
 
-    # === 数据清洗 ===
+    # 数据清洗
     rename_map = {"时间": "date", "开盘": "open", "最高": "high", "最低": "low", "收盘": "close", "成交量": "volume"}
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
     
@@ -47,13 +43,12 @@ def fetch_stock_data_dynamic(symbol: str, buy_date_str: str) -> dict:
     valid_cols = [c for c in cols if c in df.columns]
     df[valid_cols] = df[valid_cols].astype(float)
 
-    # 修复开盘价为0
     if "open" in df.columns and (df["open"] == 0).any():
         df["open"] = df["open"].replace(0, np.nan)
         if "close" in df.columns:
             df["open"] = df["open"].fillna(df["close"].shift(1)).fillna(df["close"])
 
-    # === 核心修改：强制截取最后 500 根 ===
+    # 强制截取最后 500 根
     if len(df) > 500:
         df = df.tail(500).reset_index(drop=True)
     
@@ -82,7 +77,6 @@ def generate_local_chart(symbol: str, df: pd.DataFrame, save_path: str, period: 
     if 'ma200' in plot_df.columns: apds.append(mpf.make_addplot(plot_df['ma200'], color='#2196f3', width=2.0))
 
     try:
-        # title 增加显示 bar count
         mpf.plot(plot_df, type='candle', style=s, addplot=apds, volume=True, 
                  title=f"Wyckoff: {symbol} ({period} | {len(plot_df)} bars)", 
                  savefig=dict(fname=save_path, dpi=150, bbox_inches='tight'), 
@@ -91,7 +85,7 @@ def generate_local_chart(symbol: str, df: pd.DataFrame, save_path: str, period: 
         print(f"   [Error] {symbol} 绘图失败: {e}")
 
 # ==========================================
-# 3. AI 分析模块 (Fail Fast & Auto-Fallback)
+# 3. AI 分析模块 (300s 超时 + 429 Fail Fast)
 # ==========================================
 
 def get_prompt_content(symbol, df, position_info):
@@ -177,7 +171,7 @@ def call_gemini_http(prompt: str) -> str:
                 
                 return text 
             
-            # 429 Limit -> 直接切 OpenAI
+            # 429 Limit -> 不重试，直接抛异常给上层，让它切 OpenAI
             elif resp.status_code == 429:
                 raise Exception(f"Gemini 429 Rate Limit: {resp.text[:100]}")
 
@@ -191,7 +185,7 @@ def call_gemini_http(prompt: str) -> str:
                 raise Exception(f"HTTP {resp.status_code}: {resp.text}")
 
         except Exception as e:
-            if "429" in str(e): raise e
+            if "429" in str(e): raise e # 抛出 429
             if attempt == max_retries - 1:
                 print(f"   ❌ Gemini Final Fail: {e}")
                 raise e
@@ -265,7 +259,7 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
     except: return False
 
 # ==========================================
-# 5. 主程序 (串行处理)
+# 5. 主程序 (手动循环 + 强制休息)
 # ==========================================
 
 def process_one_stock(symbol: str, position_info: dict):
@@ -318,21 +312,22 @@ def main():
 
     generated_pdfs = []
     
-    # 串行处理 (Max Workers = 1)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future_to_symbol = {
-            executor.submit(process_one_stock, symbol, info): symbol 
-            for symbol, info in stocks_dict.items()
-        }
+    # ⚠️ 关键修改：不再使用线程池，改为手动循环
+    # 这样可以在每两个股票之间强制休息，防止 Gemini 3 Flash 的 429 报错
+    
+    items = list(stocks_dict.items())
+    for i, (symbol, info) in enumerate(items):
+        try:
+            pdf_path = process_one_stock(symbol, info)
+            if pdf_path:
+                generated_pdfs.append(pdf_path)
+        except Exception as e:
+            print(f"❌ [{symbol}] 处理发生异常: {e}")
         
-        for future in concurrent.futures.as_completed(future_to_symbol):
-            symbol = future_to_symbol[future]
-            try:
-                result = future.result()
-                if result:
-                    generated_pdfs.append(result)
-            except Exception as exc:
-                print(f"❌ [{symbol}] 处理发生异常: {exc}")
+        # 如果不是最后一个，强制休息 20 秒
+        if i < len(items) - 1:
+            print("⏳ 强制冷却 20秒 (防止 Gemini 429)...")
+            time.sleep(20)
 
     if generated_pdfs:
         print(f"\n📝 生成推送清单 ({len(generated_pdfs)}):")
@@ -345,4 +340,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
