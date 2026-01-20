@@ -159,7 +159,7 @@ def call_gemini_http(prompt: str) -> str:
     max_retries = 2
     for attempt in range(max_retries):
         try:
-            resp = requests.post(url, headers=headers, json=data, timeout=180)
+            resp = requests.post(url, headers=headers, json=data, timeout=300)
             
             if resp.status_code == 200:
                 result = resp.json()
@@ -345,3 +345,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
