@@ -12,31 +12,33 @@ from xhtml2pdf import pisa
 from sheet_manager import SheetManager 
 
 # ==========================================
-# 1. 数据获取模块 (智能策略版)
+# 1. 数据获取模块 (修复核心: 强制补0)
 # ==========================================
 
 def fetch_stock_data_dynamic(symbol: str, buy_date_str: str) -> dict:
     """
-    智能获取数据策略：
-    1. 强制补全代码 (2641 -> 002641)
-    2. 计算 start_date = buy_date - 15天
-    3. 优先拉取 5分钟 K线，若过长则切换 15分钟
+    智能获取数据策略
     """
-    # === 核心修复: 确保传入 AkShare 的是 6 位数字字符串 ===
-    raw_code = ''.join(filter(str.isdigit, str(symbol)))
-    symbol_code = raw_code.zfill(6)
-    
-    print(f"   -> 正在分析 {symbol_code} (买入日期: {buy_date_str})...")
+    # === 调试日志：看看原始数据到底是啥 ===
+    print(f"   [Debug] 原始传入代码: '{symbol}' (类型: {type(symbol)})")
 
-    # 1. 计算开始时间 (近似倒推15个自然日)
+    # === 核心修复：不管传入什么，全部强转字符串并补齐6位 ===
+    # 1. 转字符串并去除空格
+    str_symbol = str(symbol).strip()
+    # 2. 提取纯数字 (防止有 .SZ 等后缀干扰)
+    clean_digits = ''.join(filter(str.isdigit, str_symbol))
+    # 3. 补齐 6 位 (比如 2641 -> 002641)
+    symbol_code = clean_digits.zfill(6)
+    
+    print(f"   -> 正在分析 标准代码: {symbol_code} (买入日期: {buy_date_str})...")
+
+    # 1. 计算开始时间
     try:
-        if buy_date_str and buy_date_str != 'Unknown' and len(str(buy_date_str)) >= 10:
-            # 兼容 Google Sheets 可能传来的 '2025-01-01' 或其他格式
+        if buy_date_str and str(buy_date_str) != 'nan' and len(str(buy_date_str)) >= 10:
             buy_dt = datetime.strptime(str(buy_date_str)[:10], "%Y-%m-%d")
             start_dt = buy_dt - timedelta(days=15) 
             start_date_em = start_dt.strftime("%Y%m%d")
         else:
-            # 默认
             start_date_em = (datetime.now() - timedelta(days=15)).strftime("%Y%m%d")
     except Exception as e:
         print(f"   [Warn] 日期解析失败 ({buy_date_str}), 使用默认窗口: {e}")
@@ -44,6 +46,7 @@ def fetch_stock_data_dynamic(symbol: str, buy_date_str: str) -> dict:
 
     # 2. 尝试拉取 5分钟 K线
     try:
+        # 注意：这里必须传 symbol_code (002641)，绝对不能传原始 symbol
         df = ak.stock_zh_a_hist_min_em(
             symbol=symbol_code, 
             period="5", 
@@ -62,12 +65,9 @@ def fetch_stock_data_dynamic(symbol: str, buy_date_str: str) -> dict:
     if len(df) > 960:
         print(f"   [策略] 5分钟数据({len(df)}根)过长，切换至 15分钟 K线 (最近960根)...")
         try:
-            # 15分钟线
             df_15 = ak.stock_zh_a_hist_min_em(symbol=symbol_code, period="15", adjust="qfq")
-            # 统一列名
             rename_map = {"时间": "date", "开盘": "open", "最高": "high", "最低": "low", "收盘": "close", "成交量": "volume"}
             df_15 = df_15.rename(columns={k: v for k, v in rename_map.items() if k in df_15.columns})
-            
             df = df_15.tail(960).reset_index(drop=True) 
             current_period = "15m"
         except Exception as e:
@@ -80,22 +80,29 @@ def fetch_stock_data_dynamic(symbol: str, buy_date_str: str) -> dict:
         "最低": "low", "收盘": "close", "成交量": "volume"
     }
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
-    df["date"] = pd.to_datetime(df["date"])
+    
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
+    
     cols = ["open", "high", "low", "close", "volume"]
-    df[cols] = df[cols].astype(float)
+    # 确保列存在再转换
+    valid_cols = [c for c in cols if c in df.columns]
+    df[valid_cols] = df[valid_cols].astype(float)
 
     # 修复 Open=0
-    if (df["open"] == 0).any():
+    if "open" in df.columns and (df["open"] == 0).any():
         df["open"] = df["open"].replace(0, np.nan)
-        df["open"] = df["open"].fillna(df["close"].shift(1))
-        df["open"] = df["open"].fillna(df["close"])
+        if "close" in df.columns:
+            df["open"] = df["open"].fillna(df["close"].shift(1))
+            df["open"] = df["open"].fillna(df["close"])
 
     return {"df": df, "period": current_period}
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["ma50"] = df["close"].rolling(50).mean()
-    df["ma200"] = df["close"].rolling(200).mean()
+    if "close" in df.columns:
+        df["ma50"] = df["close"].rolling(50).mean()
+        df["ma200"] = df["close"].rolling(200).mean()
     return df
 
 # ==========================================
@@ -106,7 +113,8 @@ def generate_local_chart(symbol: str, df: pd.DataFrame, save_path: str, period: 
     if df.empty: return
 
     plot_df = df.copy()
-    plot_df.set_index("date", inplace=True)
+    if "date" in plot_df.columns:
+        plot_df.set_index("date", inplace=True)
 
     mc = mpf.make_marketcolors(
         up='#ff3333', down='#00b060', 
@@ -270,23 +278,26 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
 # ==========================================
 
 def process_one_stock(symbol: str, position_info: dict, generated_files: list):
-    print(f"\n{'='*40}\n🚀 开始分析: {symbol}\n{'='*40}")
+    # 强制补全用于日志和文件名
+    clean_symbol = str(symbol).strip()
+    clean_digits = ''.join(filter(str.isdigit, clean_symbol))
+    clean_symbol = clean_digits.zfill(6)
 
-    data_res = fetch_stock_data_dynamic(symbol, position_info.get('date'))
+    print(f"\n{'='*40}\n🚀 开始分析: {clean_symbol}\n{'='*40}")
+
+    # 调用数据获取 (注意：这里传原始 symbol 进去让函数内部去处理补0，也可以传 clean_symbol)
+    data_res = fetch_stock_data_dynamic(clean_symbol, position_info.get('date'))
     df = data_res["df"]
     period = data_res["period"]
     
     if df.empty:
-        print(f"   [Skip] 数据为空，跳过 {symbol}")
+        print(f"   [Skip] 数据为空，跳过 {clean_symbol}")
         return
     df = add_indicators(df)
 
     # 文件名生成
     beijing_tz = timezone(timedelta(hours=8))
     ts = datetime.now(beijing_tz).strftime("%Y%m%d_%H%M%S")
-    
-    # 强制补全 symbol 以防万一
-    clean_symbol = str(symbol).strip().zfill(6)
     
     chart_path = f"reports/{clean_symbol}_chart_{ts}.png"
     pdf_path = f"reports/{clean_symbol}_report_{period}_{ts}.pdf"
