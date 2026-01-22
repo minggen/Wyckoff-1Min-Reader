@@ -87,7 +87,7 @@ def call_gemini_http(prompt: str) -> str:
         "safetySettings": safety_settings,
     }
 
-    # ⚠️ 修改点：默认重试次数改为 1
+    # ⚠️ 默认重试次数
     max_retries = int(os.getenv("GEMINI_MAX_RETRIES", "1"))
     base_sleep = float(os.getenv("GEMINI_BASE_SLEEP", "3.0"))
     timeout_s = int(os.getenv("GEMINI_TIMEOUT", "120"))
@@ -153,6 +153,89 @@ def _get_baostock_code(symbol: str) -> str:
     if symbol.startswith("8") or symbol.startswith("4"): return f"bj.{symbol}"
     return f"sz.{symbol}"
 
+def _detect_and_fix_volume_units(df_bs: pd.DataFrame, df_ak: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    智能修正 AkShare 的成交量单位（手 vs 股）。
+    策略：
+    1. 【单源 AkShare】使用统计学特征（整百率 mod100）判断。
+       - 如果成交量大部分能被100整除（mod100 > 0.9），认为是“股”。
+       - 如果大量出现非整百数（如53, 1, 5），认为是“手”，需 x100。
+    2. 【双源对比】使用 BaoStock vs AkShare 的重叠数据中位数比值。
+    """
+
+    # === A. 单源 AkShare 处理 (无 BaoStock 数据时) ===
+    if df_bs.empty and not df_ak.empty:
+        # 1. 兜底：样本太少，统计学失效，默认按“手”处理（AkShare特性）
+        v = df_ak["volume"].dropna()
+        if len(v) < 50:
+            print(f"   ⚖️ (单源兜底) 样本不足({len(v)})，默认按“手”->“股”修正 (x100)", flush=True)
+            df_ak = df_ak.copy()
+            df_ak["volume"] *= 100
+            return df_bs, df_ak
+
+        # 2. 统计学特征分析
+        # mod100: 能被100整除的比例。
+        # 如果是“股”，因为买卖通常是100股整数倍，这个比例会很高（>0.9）。
+        # 如果是“手”，会出现 1, 5, 53 等数字，这个比例会很低。
+        mod100 = float((v % 100 == 0).mean())
+        med = float(v.median())
+
+        print(f"   🔎 (单源分析) AkShare vol_median={med:.0f}, 整百率(mod100)={mod100:.2%}", flush=True)
+
+        # 3. 决策逻辑
+        # 安全阀：如果 90% 以上的数据都能被100整除，说明很有可能已经是“股”了，千万别再乘！
+        if mod100 > 0.9:
+            print(f"   ✅ (单源) 检测到整百率极高({mod100:.1%})，判断单位已为'股'，跳过修正", flush=True)
+            return df_bs, df_ak
+        
+        # 否则，默认为“手”，执行修正
+        df_ak = df_ak.copy()
+        df_ak["volume"] *= 100
+        print(f"   ⚖️ (单源修正) 整百率低({mod100:.1%}) -> 判定为'手' -> 修正 (x100)", flush=True)
+
+        return df_bs, df_ak
+
+    # === B. 双源缺失处理 ===
+    if df_bs.empty or df_ak.empty:
+        return df_bs, df_ak
+
+    # === C. 双源对比 (BaoStock vs AkShare) ===
+    # 取重叠区间进行对比
+    a = df_bs[["date", "volume"]].dropna()
+    b = df_ak[["date", "volume"]].dropna()
+    m = a.merge(b, on="date", how="inner", suffixes=("_bs", "_ak"))
+    m = m[(m["volume_bs"] > 0) & (m["volume_ak"] > 0)]
+
+    if len(m) < 10: 
+        return df_bs, df_ak
+
+    m = m.tail(200) # 只看最近
+    ratio_med = float((m["volume_bs"] / m["volume_ak"]).median())
+
+    def _in(r, center, tol=0.25):
+        return (center*(1-tol)) <= r <= (center*(1+tol))
+
+    df_ak = df_ak.copy() 
+    df_bs = df_bs.copy()
+
+    if _in(ratio_med, 1000):
+        print(f"   ⚖️ [双源修正] AkShare 单位 x1000 (Ratio={ratio_med:.1f})", flush=True)
+        df_ak["volume"] *= 1000
+    elif _in(ratio_med, 100):
+        print(f"   ⚖️ [双源修正] AkShare 单位 x100 (Ratio={ratio_med:.1f})", flush=True)
+        df_ak["volume"] *= 100
+    elif _in(ratio_med, 0.001):
+        print(f"   ⚖️ [双源修正] BaoStock 单位 x1000 (Ratio={ratio_med:.1f})", flush=True)
+        df_bs["volume"] *= 1000
+    elif _in(ratio_med, 0.01):
+        print(f"   ⚖️ [双源修正] BaoStock 单位 x100 (Ratio={ratio_med:.1f})", flush=True)
+        df_bs["volume"] *= 100
+    else:
+        # 如果比例接近1，说明单位一致，无需操作
+        pass
+        
+    return df_bs, df_ak
+
 def fetch_stock_data_dynamic(symbol: str, timeframe_str: str, bar_count_str: str) -> dict:
     clean_digits = ''.join(filter(str.isdigit, str(symbol)))
     symbol_code = clean_digits.zfill(6)
@@ -212,39 +295,30 @@ def fetch_stock_data_dynamic(symbol: str, timeframe_str: str, bar_count_str: str
     try:
         df_ak = ak.stock_zh_a_hist_min_em(symbol=symbol_code, period=str(tf_min), start_date=ak_fetch_start, adjust="qfq")
         if not df_ak.empty:
-            rename_map = {"时间": "date", "开盘": "open", "最高": "high", "最低": "low", "收盘": "close", "成交量": "volume"}
+            rename_map = {
+                "时间": "date", "开盘": "open", "最高": "high", "最低": "low", 
+                "收盘": "close", "成交量": "volume"
+            }
             df_ak = df_ak.rename(columns={k: v for k, v in rename_map.items() if k in df_ak.columns})
             df_ak["date"] = pd.to_datetime(df_ak["date"], errors="coerce")
+            
             cols = ["open", "high", "low", "close", "volume"]
             for c in cols: df_ak[c] = pd.to_numeric(df_ak[c], errors="coerce")
+            
             df_ak["open"] = df_ak["open"].replace(0, np.nan)
             df_ak["open"] = df_ak["open"].fillna(df_ak["close"].shift(1)).fillna(df_ak["close"])
             df_ak = df_ak.dropna(subset=["date", "close"])
             df_ak = df_ak[["date", "open", "high", "low", "close", "volume"]]
+            
     except Exception as e:
         print(f"   [AkShare] 异常: {e}", flush=True)
 
-    # === C. 合并 ===
+    # === C. 合并与单位修正 ===
     if df_bs.empty and df_ak.empty:
         return {"df": pd.DataFrame(), "period": f"{tf_min}m"}
     
-    if not df_bs.empty and not df_ak.empty:
-        mean_bs = df_bs['volume'].mean()
-        mean_ak = df_ak['volume'].mean()
-        if mean_bs > 0 and mean_ak > 0:
-            ratio = mean_bs / mean_ak
-            if 800 < ratio < 1200:
-                print(f"   ⚖️ 修正 AkShare 单位 (x1000)", flush=True)
-                df_ak['volume'] = df_ak['volume'] * 1000
-            elif 0.0008 < ratio < 0.0012:
-                print(f"   ⚖️ 修正 BaoStock 单位 (x1000)", flush=True)
-                df_bs['volume'] = df_bs['volume'] * 1000
-            elif 80 < ratio < 120:
-                print(f"   ⚖️ 修正 AkShare 单位 (x100)", flush=True)
-                df_ak['volume'] = df_ak['volume'] * 100
-            elif 0.008 < ratio < 0.012:
-                print(f"   ⚖️ 修正 BaoStock 单位 (x100)", flush=True)
-                df_bs['volume'] = df_bs['volume'] * 100
+    # 调用智能修正函数
+    df_bs, df_ak = _detect_and_fix_volume_units(df_bs, df_ak)
 
     df_final = pd.concat([df_bs, df_ak], axis=0, ignore_index=True)
     df_final = df_final[["date", "open", "high", "low", "close", "volume"]]
@@ -497,7 +571,7 @@ def main():
         except Exception as e:
             print(f"❌ [{symbol}] 处理发生异常: {e}", flush=True)
 
-        # ⚠️ 修改点：强制冷却缩短为 30 秒
+        # ⚠️ 强制冷却 30 秒
         if i < len(items) - 1:
             print("⏳ 强制冷却 30秒...", flush=True)
             time.sleep(30)
